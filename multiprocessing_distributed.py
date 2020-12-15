@@ -1,5 +1,3 @@
-# https://github.com/pytorch/examples/blob/master/imagenet/main.py
-
 import csv
 
 import argparse
@@ -26,7 +24,7 @@ model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('--data', metavar='DIR', default='/home/zhangzhi/Data/ImageNet2012', help='path to dataset')
+parser.add_argument('--data', metavar='DIR', default='/home/zhangzhi/Data/exports/ImageNet2012', help='path to dataset')
 parser.add_argument('-a',
                     '--arch',
                     metavar='ARCH',
@@ -43,7 +41,7 @@ parser.add_argument('--epochs', default=90, type=int, metavar='N', help='number 
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('-b',
                     '--batch-size',
-                    default=256,
+                    default=3200,
                     type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
@@ -69,12 +67,24 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', he
 parser.add_argument('--pretrained', dest='pretrained', action='store_true', help='use pre-trained model')
 parser.add_argument('--seed', default=None, type=int, help='seed for initializing training. ')
 
-best_acc1 = 0
+
+def reduce_mean(tensor, nprocs):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= nprocs
+    return rt
 
 
 def main():
     args = parser.parse_args()
+    args.nprocs = torch.cuda.device_count()
 
+    mp.spawn(main_worker, nprocs=args.nprocs, args=(args.nprocs, args))
+
+
+def main_worker(local_rank, nprocs, args):
+    args.local_rank = local_rank
+    
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -85,13 +95,9 @@ def main():
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-    mp.spawn(main_worker, nprocs=4, args=(4, args))
+    best_acc1 = .0
 
-
-def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1
-
-    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:23456', world_size=4, rank=gpu)
+    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:23456', world_size=args.nprocs, rank=local_rank)
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -100,16 +106,16 @@ def main_worker(gpu, ngpus_per_node, args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
-    torch.cuda.set_device(gpu)
-    model.cuda(gpu)
+    torch.cuda.set_device(local_rank)
+    model.cuda(local_rank)
     # When using a single GPU per process and per
     # DistributedDataParallel, we need to divide the batch size
     # ourselves based on the total number of GPUs we have
-    args.batch_size = int(args.batch_size / ngpus_per_node)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+    args.batch_size = int(args.batch_size / args.nprocs)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(gpu)
+    criterion = nn.CrossEntropyLoss().cuda(local_rank)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
@@ -128,68 +134,60 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]))
-
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.batch_size,
-                                               shuffle=(train_sampler is None),
                                                num_workers=2,
                                                pin_memory=True,
                                                sampler=train_sampler)
 
-    val_loader = torch.utils.data.DataLoader(datasets.ImageFolder(
+    val_dataset = datasets.ImageFolder(
         valdir,
         transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
-        ])),
+        ]))
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+    val_loader = torch.utils.data.DataLoader(val_dataset,
                                              batch_size=args.batch_size,
-                                             shuffle=False,
                                              num_workers=2,
-                                             pin_memory=True)
+                                             pin_memory=True,
+                                             sampler=val_sampler)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, gpu, args)
+        validate(val_loader, model, criterion, local_rank, args)
         return
 
-    log_csv = "multiprocessing_distributed.csv"
-
     for epoch in range(args.start_epoch, args.epochs):
-        epoch_start = time.time()
 
         train_sampler.set_epoch(epoch)
+        val_sampler.set_epoch(epoch)
+
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, gpu, args)
+        train(train_loader, model, criterion, optimizer, epoch, local_rank, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, gpu, args)
+        acc1 = validate(val_loader, model, criterion, local_rank, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        epoch_end = time.time()
-
-        with open(log_csv, 'a+') as f:
-            csv_write = csv.writer(f)
-            data_row = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch_start)), epoch_end - epoch_start]
-            csv_write.writerow(data_row)
-
-        save_checkpoint(
-            {
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.module.state_dict(),
-                'best_acc1': best_acc1,
-            }, is_best)
+        if args.local_rank == 0:
+            save_checkpoint(
+                {
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.module.state_dict(),
+                    'best_acc1': best_acc1,
+                }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, gpu, args):
+def train(train_loader, model, criterion, optimizer, epoch, local_rank, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -206,8 +204,8 @@ def train(train_loader, model, criterion, optimizer, epoch, gpu, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        images = images.cuda(gpu, non_blocking=True)
-        target = target.cuda(gpu, non_blocking=True)
+        images = images.cuda(local_rank, non_blocking=True)
+        target = target.cuda(local_rank, non_blocking=True)
 
         # compute output
         output = model(images)
@@ -215,9 +213,16 @@ def train(train_loader, model, criterion, optimizer, epoch, gpu, args):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+
+        torch.distributed.barrier()
+
+        reduced_loss = reduce_mean(loss, args.nprocs)
+        reduced_acc1 = reduce_mean(acc1, args.nprocs)
+        reduced_acc5 = reduce_mean(acc5, args.nprocs)
+
+        losses.update(reduced_loss.item(), images.size(0))
+        top1.update(reduced_acc1.item(), images.size(0))
+        top5.update(reduced_acc5.item(), images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -232,7 +237,7 @@ def train(train_loader, model, criterion, optimizer, epoch, gpu, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, gpu, args):
+def validate(val_loader, model, criterion, local_rank, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -245,8 +250,8 @@ def validate(val_loader, model, criterion, gpu, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(gpu, non_blocking=True)
-            target = target.cuda(gpu, non_blocking=True)
+            images = images.cuda(local_rank, non_blocking=True)
+            target = target.cuda(local_rank, non_blocking=True)
 
             # compute output
             output = model(images)
@@ -254,9 +259,16 @@ def validate(val_loader, model, criterion, gpu, args):
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+
+            torch.distributed.barrier()
+
+            reduced_loss = reduce_mean(loss, args.nprocs)
+            reduced_acc1 = reduce_mean(acc1, args.nprocs)
+            reduced_acc5 = reduce_mean(acc5, args.nprocs)
+
+            losses.update(reduced_loss.item(), images.size(0))
+            top1.update(reduced_acc1.item(), images.size(0))
+            top5.update(reduced_acc5.item(), images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)

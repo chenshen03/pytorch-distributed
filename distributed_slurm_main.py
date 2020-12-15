@@ -1,23 +1,25 @@
-import argparse
 import os
+import csv
+import time
+import socket
 import random
 import shutil
-import time
+import argparse
 import warnings
 
 import torch
+import torch.optim
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
+
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-import horovod.torch as hvd
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -65,39 +67,38 @@ parser.add_argument('-p', '--print-freq', default=10, type=int, metavar='N', hel
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true', help='use pre-trained model')
 parser.add_argument('--seed', default=None, type=int, help='seed for initializing training. ')
+parser.add_argument('--dist-file', default=None, type=str, help='file used to initial distributed training')
 
-
-def reduce_mean(tensor, nprocs):
-    rt = tensor.clone()
-    hvd.allreduce(rt, name='barrier')
-    rt /= nprocs
-    return rt
+best_acc1 = 0
 
 
 def main():
     args = parser.parse_args()
-    args.nprocs = torch.cuda.device_count()
 
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
+        # torch.backends.cudnn.enabled = False
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
                       'which can slow down your training considerably! '
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-    hvd.init()
-    args.local_rank = hvd.local_rank()
-    torch.cuda.set_device(args.local_rank)
+    args.local_rank = int(os.environ["SLURM_PROCID"])
+    args.world_size = int(os.environ["SLURM_NPROCS"])
+    ngpus_per_node = torch.cuda.device_count()
 
-    main_worker(args.local_rank, args.nprocs, args)
+    job_id = os.environ["SLURM_JOBID"]
+    args.dist_url = "file://{}.{}".format(os.path.realpath(args.dist_file), job_id)
+    mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
 
 
-def main_worker(local_rank, nprocs, args):
-    best_acc1 = .0
-
+def main_worker(gpu, ngpus_per_node, args):
+    global best_acc1
+    rank = args.local_rank * ngpus_per_node + gpu
+    dist.init_process_group(backend='nccl', init_method=args.dist_url, world_size=args.world_size, rank=rank)
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -106,22 +107,18 @@ def main_worker(local_rank, nprocs, args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
-    model.cuda()
+    torch.cuda.set_device(gpu)
+    model.cuda(gpu)
     # When using a single GPU per process and per
     # DistributedDataParallel, we need to divide the batch size
     # ourselves based on the total number of GPUs we have
-    args.batch_size = int(args.batch_size / nprocs)
-
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    args.batch_size = int(args.batch_size / ngpus_per_node)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().cuda(gpu)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-    compression = hvd.Compression.fp16
-
-    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression)
 
     cudnn.benchmark = True
 
@@ -138,62 +135,68 @@ def main_worker(local_rank, nprocs, args):
             transforms.ToTensor(),
             normalize,
         ]))
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
-                                                                    num_replicas=hvd.size(),
-                                                                    rank=hvd.rank())
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=args.batch_size,
+                                               shuffle=(train_sampler is None),
                                                num_workers=2,
                                                pin_memory=True,
                                                sampler=train_sampler)
 
-    val_dataset = datasets.ImageFolder(
+    val_loader = torch.utils.data.DataLoader(datasets.ImageFolder(
         valdir,
         transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
-        ]))
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
-    val_loader = torch.utils.data.DataLoader(val_dataset,
+        ])),
                                              batch_size=args.batch_size,
+                                             shuffle=False,
                                              num_workers=2,
-                                             pin_memory=True,
-                                             sampler=val_sampler)
+                                             pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, gpu, args)
         return
 
+    log_csv = "distributed.csv"
+
     for epoch in range(args.start_epoch, args.epochs):
+        epoch_start = time.time()
 
         train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)
-
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, gpu, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, gpu, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        if args.local_rank == 0:
-            save_checkpoint(
-                {
-                    'epoch': epoch + 1,
-                    'arch': args.arch,
-                    'state_dict': model.state_dict(),
-                    'best_acc1': best_acc1,
-                }, is_best)
+        epoch_end = time.time()
+
+        with open(log_csv, 'a+') as f:
+            csv_write = csv.writer(f)
+            data_row = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch_start)), epoch_end - epoch_start]
+            csv_write.writerow(data_row)
+
+        save_checkpoint(
+            {
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.module.state_dict(),
+                'best_acc1': best_acc1,
+            }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, gpu, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -210,8 +213,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        images = images.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        images = images.cuda(gpu, non_blocking=True)
+        target = target.cuda(gpu, non_blocking=True)
 
         # compute output
         output = model(images)
@@ -219,14 +222,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-        reduced_loss = reduce_mean(loss, args.nprocs)
-        reduced_acc1 = reduce_mean(acc1, args.nprocs)
-        reduced_acc5 = reduce_mean(acc5, args.nprocs)
-
-        losses.update(reduced_loss.item(), images.size(0))
-        top1.update(reduced_acc1.item(), images.size(0))
-        top5.update(reduced_acc5.item(), images.size(0))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -241,7 +239,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, gpu, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -254,8 +252,8 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
+            images = images.cuda(gpu, non_blocking=True)
+            target = target.cuda(gpu, non_blocking=True)
 
             # compute output
             output = model(images)
@@ -263,14 +261,9 @@ def validate(val_loader, model, criterion, args):
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-            reduced_loss = reduce_mean(loss, args.nprocs)
-            reduced_acc1 = reduce_mean(acc1, args.nprocs)
-            reduced_acc5 = reduce_mean(acc5, args.nprocs)
-
-            losses.update(reduced_loss.item(), images.size(0))
-            top1.update(reduced_acc1.item(), images.size(0))
-            top5.update(reduced_acc5.item(), images.size(0))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
